@@ -1,4 +1,4 @@
-# cash-mode
+# job-radar
 
 A personal job-search pipeline. It fetches remote-eligible listings from Jobgether, scores each one against my background with Claude, and gives me a small local web page where I review the ranked list, track what I've applied to, and draft a cover letter only for the jobs I actually want.
 
@@ -14,7 +14,7 @@ Most listings on the boards I used were either not open to someone in Finland or
 2. **Extract.** Claude Haiku reads each posting and returns structured facts: years of experience required, which hard requirements I meet, whether I'm eligible to work remotely from Finland, salary if shown, and a set of red-flag fields.
 3. **Score.** `compute_score()` turns those facts into a score from 0 to 100 using plain Python arithmetic.
 4. **Review.** `serve.py` runs a Flask page at `localhost:5000`. I filter by minimum score and date, and mark each job as Applied or Skip so the list shrinks as I work through it.
-5. **Draft.** For a single job, one click asks Claude Sonnet for a tailored CV profile paragraph and a cover letter.
+5. **Draft.** For a single job, one click asks Claude Sonnet for a tailored CV profile paragraph and a cover letter. The output is a draft, not a finished application: I edit every letter before sending it.
 
 ## Design decisions
 
@@ -38,7 +38,7 @@ python run.py                                             fetch and score new li
 python serve.py                                           open http://127.0.0.1:5000
 ```
 
-The `.example.md` prompts contain a made-up candidate. Replace the block in `prompts\candidate_facts.md` with your own background — `score_cash.md` and `tailor.md` both pull it in from there at runtime. Your copies are gitignored, so your personal details stay out of the repo.
+The `.example.md` prompts contain a made-up candidate. Replace the block in `prompts\candidate_facts.md` with your own background. `score_cash.md` and `tailor.md` both pull it in from there at runtime. Your copies are gitignored, so your personal details stay out of the repo.
 
 ## A note on fetching
 

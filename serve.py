@@ -64,7 +64,7 @@ def index():
     jobs = rows(min_score, days, view)
     cards = "".join(card(j, i) for i, j in enumerate(jobs))
     sel = lambda v: "selected" if v == view else ""
-    return f"""<!doctype html><meta charset="utf-8"><title>Cash-mode jobs</title><style>{CSS}</style>
+    return f"""<!doctype html><meta charset="utf-8"><title>job-radar jobs</title><style>{CSS}</style>
 <form class="bar">Min score <input type="number" name="min" value="{min_score}"> Last <input type="number" name="days" value="{days}"> run-days
 <select name="view"><option value="open" {sel('open')}>Open</option><option value="applied" {sel('applied')}>Applied</option><option value="all" {sel('all')}>All</option></select>
 <button>Show</button> <span>{len(jobs)} jobs</span></form>{cards or '<p>Nothing here.</p>'}"""

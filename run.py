@@ -1,4 +1,4 @@
-"""Cash-mode daily run: fetch → filter → dedupe → score → top5 → tailor → HTML."""
+"""job-radar daily run: fetch → filter → dedupe → score → top5 → tailor → HTML."""
 import html
 import json
 import os
