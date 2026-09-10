@@ -1,0 +1,26 @@
+# Secrets and personal data
+.env
+*.db
+*.bak
+
+# One-off migration scripts
+patch_*.py
+
+# Generated output (CVs, reports)
+*.pdf
+reports/
+output/
+out/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Personal prompts (public versions are prompts/*.example.md)
+prompts/score_cash.md
+prompts/tailor.md
+prompts/candidate_facts.md
+
+SPEC.md
