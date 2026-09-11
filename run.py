@@ -4,10 +4,16 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import date
 from pathlib import Path
 
 import anthropic
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # scraped names can carry any unicode
+except AttributeError:
+    pass
 
 from sources.jobgether import JobgetherSource
 
@@ -33,6 +39,20 @@ TAILOR_PROMPT = (ROOT / "prompts/tailor.md").read_text(encoding="utf-8")
 
 SENIOR = re.compile(r"\b(senior|staff|principal|lead|head of|director|vp|chief)\b", re.I)
 US_ONLY = re.compile(r"\b(US only|U\.S\. only|United States only|must be (located|based) in the (US|United States))\b", re.I)
+
+NEGATIVE_TITLE_RE = re.compile(r"\b(coordinator|representative|instructor|tutor|trainer|freelance|hourly|intern)\b", re.I)
+TECH_TRAINER_RE = re.compile(r"\btechnical\s+trainer\b", re.I)
+SOFTWARE_ROLE_FAMILIES = {"technical_pm", "qa", "engineering", "solutions_implementation"}
+TITLE_CAP = 30
+INSTRUCTOR_TITLE_RE = re.compile(r"\b(instructor|teacher)\b", re.I)
+BLOCKLIST_FILE = ROOT / "companies_blocked.txt"
+BLOCKLIST_NOTES_FILE = ROOT / "companies_blocked_notes.txt"  # gitignored: private vetting notes
+US_HQ_STRINGS = {"us", "usa", "u.s.", "u.s.a.", "united states", "united states of america"}
+OFFER_DETAIL_FIELDS = ("ats_url", "ats_text", "post_date", "undated", "eu_tokens_absent",
+                        "benefits_text", "location_text_source", "geo_verdict", "geo_evidence")
+EVERGREEN_CAP = 40
+UNDATED_CAP = 50
+US_PROBABLE_CAP = 40
 
 
 def pre_filter(job):
@@ -71,7 +91,114 @@ def _excluded_countries():
     return {c.strip().lower() for c in os.getenv("EXCLUDED_COUNTRIES", "").split(",") if c.strip()}
 
 
+def _blocked_companies():
+    """{lowercased name-or-substring: reason}. Both companies_blocked.txt and
+    companies_blocked_notes.txt are gitignored (naming a company, even without a reason, isn't
+    meant to be public) — see companies_blocked.example.txt for the format. Either file can hold
+    'Company' or 'Company | reason' lines; notes.txt is just a place to add a reason for a
+    company already listed (or not) in the main file, so the two merge, notes.txt winning on
+    reason when both set one."""
+    out = {}
+    for path in (BLOCKLIST_FILE, BLOCKLIST_NOTES_FILE):
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|" in line:
+                name, reason = line.split("|", 1)
+                name, reason = name.strip().lower(), reason.strip()
+            else:
+                name, reason = line.lower(), ""
+            out[name] = reason or out.get(name, "")
+    return out
+
+
+def _add_to_blocklist(company, reason=""):
+    """Name goes in companies_blocked.txt; any reason goes in companies_blocked_notes.txt — both gitignored."""
+    company = (company or "").strip()
+    if not company or company.lower() in _blocked_companies():
+        return
+    with BLOCKLIST_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(company + "\n")
+    if reason:
+        with BLOCKLIST_NOTES_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{company} | {reason}\n")
+
+
+def _title_tokens(title):
+    return set(re.findall(r"[a-z0-9]+", (title or "").lower()))
+
+
+def _title_similarity(a, b):
+    """Overlap coefficient (intersection / smaller set), not Jaccard: a repost mill often
+    embellishes the same title ("QA Engineer" -> "AI-first QA Engineer"), so the shorter
+    title being fully contained in the longer one should count as a match even though the
+    union is large."""
+    ta, tb = _title_tokens(a), _title_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / min(len(ta), len(tb))
+
+
+def _detect_evergreen(jobs):
+    """Same company posting near-identical titles (>80% token overlap) under separate
+    Jobgether IDs — an evergreen/perpetually-reposted req, not one listing's own staleness
+    (which post_date/STALE_DAYS_SOFT already covers). jobs: iterable of {"url","title","company"}."""
+    from collections import defaultdict
+    by_company, seen = defaultdict(list), set()
+    for j in jobs:
+        if j["url"] in seen or not j["company"].strip():
+            continue
+        seen.add(j["url"])
+        by_company[j["company"].strip().lower()].append(j)
+    flagged = set()
+    for company, group in by_company.items():
+        for i in range(len(group)):
+            for k in range(i + 1, len(group)):
+                if _title_similarity(group[i]["title"], group[k]["title"]) > 0.8:
+                    flagged.add(group[i]["url"]); flagged.add(group[k]["url"])
+    return flagged
+
+
+def _detect_reposts(jobs):
+    """Same title+company posted as separate Jobgether listings for DIFFERENT country labels
+    (the Ireland/Spain/UK mass-distribution pattern). Must NOT fire when a listing simply moved
+    ATS host (e.g. Greenhouse -> Ashby) with the same title, company, and country — that's a
+    migration, not a repost, so the check is on remote_from, not on URL/host count."""
+    from collections import defaultdict
+    by_key = defaultdict(list)
+    for j in jobs:
+        by_key[(j["title"].strip().lower(), j["company"].strip().lower())].append(j)
+    reposted_urls = set()
+    for key, group in by_key.items():
+        countries = {j.get("remote_from", "").strip().lower() for j in group}
+        if len(group) > 1 and len(countries) > 1:
+            reposted_urls.update(j["url"] for j in group)
+    return reposted_urls
+
+
+def _detect_gig_marketplaces(jobs):
+    """Company with >5 concurrent listings, mostly 'X Instructor/Teacher - Remote' — tutoring mill pattern."""
+    from collections import defaultdict
+    by_company = defaultdict(list)
+    for j in jobs:
+        if j["company"].strip():
+            by_company[j["company"].strip()].append(j)
+    flagged = set()
+    for company, group in by_company.items():
+        if len(group) <= 5:
+            continue
+        matches = sum(1 for j in group if INSTRUCTOR_TITLE_RE.search(j["title"]))
+        if matches / len(group) > 0.5:
+            flagged.add(company)
+    return flagged
+
+
 STALE_DAYS = 180
+STALE_DAYS_SOFT = 60
+STALE_PENALTY = 20
 
 
 def _days_old(d):
@@ -89,8 +216,8 @@ def _days_old(d):
 
 
 def red_flags(f):
-    """Returns (hard_zero: bool, cap: int|None, flags: list[str])."""
-    flags, hard, cap = [], False, None
+    """Returns (hard_zero: bool, cap: int|None, penalty: int, flags: list[str])."""
+    flags, hard, cap, penalty = [], False, None, 0
     country = (f.get("company_country") or "").strip().lower()
     if country and any(c in country for c in _excluded_countries()):
         flags.append(f"hq {country}"); hard = True
@@ -100,15 +227,51 @@ def red_flags(f):
         flags.append("single-market product"); cap = min(cap or 100, 40)
     if f.get("religious_or_political"):
         flags.append("religious/political mission"); cap = min(cap or 100, 30)
-    age = _days_old(f.get("posting_date"))
-    if age is not None and age > STALE_DAYS:
-        flags.append(f"posted {age}d ago"); cap = min(cap or 100, 40)
-    return hard, cap, flags
+
+    company = (f.get("company") or "").strip().lower()
+    blocked = _blocked_companies()
+    hit = next((b for b in blocked if b in company), None) if company else None
+    if hit:
+        reason = blocked[hit]
+        flags.append(f"blocked company: {f.get('company')}" + (f" ({reason})" if reason else "")); hard = True
+    if f.get("gig_marketplace"):
+        flags.append("gig/tutoring marketplace pattern"); hard = True
+
+    if f.get("geo_verdict") == "us_only":
+        flags.append(f"geo: {f.get('geo_evidence') or 'US-only'}"); hard = True
+    elif f.get("geo_verdict") == "unknown" and (f.get("hq_country") or "").strip().lower() in US_HQ_STRINGS \
+            and f.get("eu_tokens_absent"):
+        # inference, not evidence — US HQ plus no EU/EMEA/UK/CET/GMT token anywhere in the text.
+        # Capped, not zeroed, and deliberately doesn't touch the stored geo_verdict/geo_evidence
+        # (those stay "unknown" — this is a separate, weaker signal).
+        flags.append("geo: us_probable (US HQ, no EU/EMEA/UK/CET/GMT token found)"); cap = min(cap or 100, US_PROBABLE_CAP)
+
+    if f.get("evergreen"):
+        flags.append("evergreen repost (similar title, separate Jobgether ID)"); cap = min(cap or 100, EVERGREEN_CAP)
+
+    title = f.get("title") or ""
+    if title and not (TECH_TRAINER_RE.search(title) and f.get("role_family") in SOFTWARE_ROLE_FAMILIES):
+        if NEGATIVE_TITLE_RE.search(title):
+            flags.append("negative-list title"); cap = min(cap or 100, TITLE_CAP)
+
+    if f.get("undated"):
+        flags.append("no verifiable post date"); cap = min(cap or 100, UNDATED_CAP)
+    else:
+        age = _days_old(f.get("post_date") or f.get("posting_date"))
+        if age is not None and age > STALE_DAYS:
+            flags.append(f"posted {age}d ago"); cap = min(cap or 100, 40)
+        elif age is not None and age > STALE_DAYS_SOFT:
+            flags.append(f"posted {age}d ago (stale)"); penalty += STALE_PENALTY
+
+    if f.get("repost_pattern"):
+        flags.append("repost pattern (multi-country clone)"); penalty += STALE_PENALTY
+
+    return hard, cap, penalty, flags
 
 
 def compute_score(f):
     """Deterministic score from extracted facts."""
-    hard, cap, flags = red_flags(f)
+    hard, cap, penalty, flags = red_flags(f)
     f["flags"] = flags
     if hard:
         return 0
@@ -137,15 +300,25 @@ def compute_score(f):
         score += 8
     if f.get("outsourcing_employer"):
         score = min(score, 50)
+    score -= penalty
     if cap is not None:
         score = min(score, cap)
     return int(max(0, min(100, round(score))))
 
 
+PASSTHROUGH_FIELDS = ("title", "company", "geo_verdict", "geo_evidence", "ats_url", "ats_text", "post_date",
+                      "benefits_text", "location_text_source", "repost_pattern", "gig_marketplace",
+                      "evergreen", "undated", "eu_tokens_absent")
+
+
 def score(job):
     user = f"Title: {job['title']}\nCompany: {job['company']}\nRemote from: {job['remote_from']}\nSkills: {', '.join(job['skills'])}\n\n{job.get('description','')[:6000]}"
     try:
-        f = llm_json("claude-haiku-4-5-20251001", SCORE_PROMPT, user, 500)
+        f = llm_json("claude-haiku-4-5-20251001", SCORE_PROMPT, user, 900)
+        # deterministic fields we already extracted via scraping/regex win over any LLM guess
+        for k in PASSTHROUGH_FIELDS:
+            if job.get(k) not in (None, ""):
+                f[k] = job[k]
         f["score"] = compute_score(f)
         return f
     except Exception as e:
@@ -209,7 +382,102 @@ def rescore():
             print(f"rescored {i}/{len(todo)}", flush=True)
 
 
-def main():
+def recompute_report(n=30, dry_run=True):
+    """Recompute compute_score() on the last n DB rows from stored facts only — no re-fetch, no LLM call."""
+    con = db()
+    rows = con.execute("SELECT url, payload FROM jobs ORDER BY first_seen DESC, rowid DESC LIMIT ?", (n,)).fetchall()
+    print(f"{'old':>4} {'new':>4}  {'geo':<8} {'title':<45} {'company':<25} reason")
+    for url, payload in rows:
+        j = json.loads(payload)
+        f = dict(j.get("scoring") or {})
+        f["title"] = j.get("title", "")
+        f["company"] = j.get("company", "")
+        old_score = f.get("score", 0)
+        new_score = compute_score(f)
+        geo = f.get("geo_verdict", "unknown")
+        reason = "; ".join(f.get("flags") or []) or "-"
+        print(f"{old_score:>4} {new_score:>4}  {geo:<8} {f['title'][:45]:<45} {f['company'][:25]:<25} {reason}")
+        if not dry_run and new_score != old_score:
+            j["scoring"] = f
+            j["scoring"]["score"] = new_score
+            con.execute("UPDATE jobs SET score=?, payload=? WHERE url=?", (new_score, json.dumps(j), url))
+    if dry_run:
+        print("(dry run — nothing written; drop --dry-run to persist)")
+    else:
+        con.commit()
+        print("applied.")
+
+
+def refetch(urls, dry_run=False):
+    """Re-fetch specific stored URLs (offer page + ATS follow-through) and rescore with a fresh
+    Haiku extraction. For verifying/fixing specific known rows, not a bulk operation."""
+    from sources.jobgether import _offer_details
+    con = db()
+    print(f"{'old':>4} {'new':>4}  {'geo':<8} {'title':<45} {'company':<25} reason")
+    for url in urls:
+        row = con.execute("SELECT payload FROM jobs WHERE url=?", (url,)).fetchone()
+        if not row:
+            print(f"NOT FOUND: {url}")
+            continue
+        j = json.loads(row[0])
+        old_score = (j.get("scoring") or {}).get("score", 0)
+        details = _offer_details(url, j.get("title", ""), j.get("company", ""))
+        j["description"] = details["description"]
+        for k in OFFER_DETAIL_FIELDS:
+            j[k] = details.get(k)
+        j["scoring"] = score(j)
+        new_score = j["scoring"]["score"]
+        reason = "; ".join(j["scoring"].get("flags") or []) or "-"
+        print(f"{old_score:>4} {new_score:>4}  {j['scoring'].get('geo_verdict','unknown'):<8} {j.get('title','')[:45]:<45} {j.get('company','')[:25]:<25} {reason}")
+        if not dry_run:
+            con.execute("UPDATE jobs SET score=?, payload=? WHERE url=?", (new_score, json.dumps(j), url))
+            con.commit()
+    if dry_run:
+        print("(dry run — nothing written)")
+
+
+def backfill_geo(min_score=50, dry_run=False):
+    """For existing rows scoring >= min_score with no stored ats_text, follow the stored
+    offer URL to its ATS page, populate ats_url/ats_text/post_date/geo_verdict, and rescore.
+    No listing-page fetches — only the offer URLs already sitting in the DB.
+    geo_verdict == "unknown" never changes a score: red_flags() only acts on "us_only"."""
+    from sources.jobgether import _offer_details
+    con = db()
+    rows = con.execute("SELECT url, payload FROM jobs").fetchall()
+    todo = []
+    for url, payload in rows:
+        j = json.loads(payload)
+        f = j.get("scoring") or {}
+        if f.get("score", 0) >= min_score and not f.get("ats_text"):
+            todo.append((url, j))
+    print(f"backfilling geo for {len(todo)} rows (score>={min_score}, no ats_text yet)")
+    print(f"{'old':>4} {'new':>4}  {'geo':<8} {'title':<45} {'company':<25} evidence")
+    for i, (url, j) in enumerate(todo, 1):
+        f = dict(j.get("scoring") or {})
+        old_score = f.get("score", 0)
+        details = _offer_details(url, j.get("title", ""), j.get("company", ""))
+        for k in OFFER_DETAIL_FIELDS:
+            if details.get(k) not in (None, ""):
+                f[k] = details[k]
+        f["title"] = j.get("title", "")
+        f["company"] = j.get("company", "")
+        new_score = compute_score(f)
+        f["score"] = new_score
+        j["scoring"] = f
+        evidence = (f.get("geo_evidence") or "-")[:80]
+        print(f"{old_score:>4} {new_score:>4}  {f.get('geo_verdict','unknown'):<8} {j.get('title','')[:45]:<45} {j.get('company','')[:25]:<25} {evidence}")
+        if not dry_run:
+            con.execute("UPDATE jobs SET score=?, payload=? WHERE url=?", (new_score, json.dumps(j), url))
+            con.commit()
+        if i % 10 == 0 or i == len(todo):
+            print(f"...{i}/{len(todo)}", flush=True)
+    if dry_run:
+        print("(dry run — nothing written; drop --dry-run to persist)")
+    else:
+        print("applied.")
+
+
+def main(dry_run=False):
     con = db()
     raw = []
     for s in SOURCES:
@@ -218,6 +486,21 @@ def main():
         except Exception as e:
             print(f"[{s.name}] failed: {e}")
     print(f"fetched {len(raw)}")
+
+    repost_urls = _detect_reposts(raw)
+    gig_companies = _detect_gig_marketplaces(raw)
+    # evergreen check spans the whole DB, not just this fetch, so a same-company/similar-title
+    # pair split across two different runs (e.g. an old req vs. this week's repost) is still caught
+    existing = [{"url": u, "title": json.loads(p).get("title", ""), "company": json.loads(p).get("company", "")}
+                for u, p in con.execute("SELECT url, payload FROM jobs")]
+    evergreen_urls = _detect_evergreen(raw + existing)
+    for j in raw:
+        j["repost_pattern"] = j["url"] in repost_urls
+        j["gig_marketplace"] = j["company"].strip() in gig_companies
+        j["evergreen"] = j["url"] in evergreen_urls
+    if not dry_run:
+        for c in gig_companies:
+            _add_to_blocklist(c, reason="gig/tutoring marketplace pattern (>5 concurrent Instructor/Teacher listings)")
 
     new = []
     for j in raw:
@@ -230,11 +513,19 @@ def main():
 
     for i, j in enumerate(new, 1):
         j["scoring"] = score(j)
-        con.execute("INSERT OR IGNORE INTO jobs (url, first_seen, score, payload) VALUES (?,?,?,?)",
-                    (j["url"], date.today().isoformat(), j["scoring"]["score"], json.dumps(j)))
-        con.commit()
+        if not dry_run:
+            con.execute("INSERT OR IGNORE INTO jobs (url, first_seen, score, payload) VALUES (?,?,?,?)",
+                        (j["url"], date.today().isoformat(), j["scoring"]["score"], json.dumps(j)))
+            con.commit()
         if i % 10 == 0 or i == len(new):
             print(f"scored {i}/{len(new)}", flush=True)
+
+    if dry_run:
+        print("\n--dry-run: no DB writes. Verdicts:")
+        for j in new:
+            s = j["scoring"]
+            print(f"{s.get('score',0):>3}  geo={s.get('geo_verdict','?'):<7}  {j['title'][:50]:<50} {j['company'][:25]:<25} {'; '.join(s.get('flags') or [])}")
+        return
 
     scored = sorted(new, key=lambda j: -j["scoring"]["score"])
     en = [j for j in scored if j["scoring"].get("language") != "de" and j["scoring"]["score"] >= 60]
@@ -249,4 +540,19 @@ def main():
 
 if __name__ == "__main__":
     import sys
-    rescore() if "--rescore" in sys.argv else main()
+    dry = "--dry-run" in sys.argv
+    if "--rescore" in sys.argv:
+        rescore()
+    elif "--recompute" in sys.argv:
+        recompute_report(n=30, dry_run=dry)
+    elif "--refetch" in sys.argv:
+        idx = sys.argv.index("--refetch")
+        urls = [a for a in sys.argv[idx + 1:] if not a.startswith("--")]
+        refetch(urls, dry_run=dry)
+    elif "--backfill-geo" in sys.argv:
+        min_score = 50
+        if "--min-score" in sys.argv:
+            min_score = int(sys.argv[sys.argv.index("--min-score") + 1])
+        backfill_geo(min_score=min_score, dry_run=dry)
+    else:
+        main(dry_run=dry)

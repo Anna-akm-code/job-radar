@@ -1,0 +1,11 @@
+# Copy this file to companies_blocked.txt and add your own companies.
+# One company name (or substring) per line, matched case-insensitively against the
+# scraped company field. A hit hard-zeros the score.
+#
+# Optional inline reason: "Company | reason". Keep in mind this file is meant to be
+# committed/shared, so only put a reason here if you're fine with it being public —
+# for private vetting notes, use companies_blocked_notes.txt instead (gitignored by
+# default), which is merged in automatically and can hold a reason for any company
+# regardless of whether it's also listed here.
+Example Corp
+Another Company | optional public reason

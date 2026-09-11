@@ -22,8 +22,15 @@ You extract facts from one remote job posting for one candidate. Do NOT compute 
  "local_market_product": true|false,       // product exists only for one non-EU national market (e.g. Indian Aadhaar/RBI, US state homeschool, UAE banking)
  "religious_or_political": true|false,     // religious, church, or political mission statements in the posting
  "posting_date": "YYYY-MM-DD or YYYY-MM or null",  // any posted/published date visible in the text; do not guess
+ "post_date": "YYYY-MM-DD or YYYY-MM or null",     // original posting date from the ATS/source text specifically, if shown; do not guess
+ "ats_url": "string or null",                      // the original employer/ATS application URL, if shown in the text
+ "benefits_text": "string or null",                // verbatim benefits/perks sentence(s) if listed (401k, medical, EU benefits, etc.), MAX 200 CHARACTERS — trim, do not summarize
+ "location_text_source": "string or null",         // verbatim location/eligibility sentence(s) from the text, MAX 200 CHARACTERS — trim, do not summarize
+ "hq_country": "string or null",                   // company HQ country from the "About the company" section specifically; null if not stated there
  "reason": "one sentence: the 2–3 facts that decide this one"
 }
+
+Ignore any "match score", "AI match", or fit-percentage text if present in the input — it is not part of this posting and must not influence any field above.
 
 CANDIDATE
 {{CANDIDATE_FACTS}}

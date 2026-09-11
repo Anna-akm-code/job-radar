@@ -2,6 +2,8 @@
 .env
 *.db
 *.bak
+companies_blocked.txt
+companies_blocked_notes.txt
 
 # One-off migration scripts
 patch_*.py
