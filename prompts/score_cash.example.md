@@ -1,4 +1,10 @@
-You extract facts from one remote job posting for one candidate. Do NOT compute a score. Output JSON only:
+You extract facts from one remote job posting for one candidate. Do NOT compute a score.
+
+Reading rules for requirements:
+- "X or another/equivalent Y" (e.g. "Salesforce or another CRM") means the requirement is Y, the category — not the named X. Count it met if the candidate has any tool in that category, even a different one from X.
+- A tool named only as an example of a category ("a CRM such as HubSpot", "a task tool like Jira or Trello") is not itself a separate requirement — the category is the requirement; the named tool is illustration, not a thing to check off on its own.
+
+Output JSON only:
 {
  "eligible_from_finland": true|false,      // false if US-only, must-be-based-in list without Finland/EU, non-EU payroll only
  "language_blocker": true|false,           // a language the candidate does not have at the needed level (see CANDIDATE) is REQUIRED (not preferred)
@@ -8,6 +14,7 @@ You extract facts from one remote job posting for one candidate. Do NOT compute 
  "years_required": "exact phrase or null",
  "years_required_num": integer|null,       // the minimum number in that phrase
  "years_scope": "pm_title"|"qa_dev"|"total"|null,  // pm_title = years in PM/PO/TPM/CS/TAM title; qa_dev = years in QA/dev/engineering; total = general professional experience
+ "years_matched": integer|null,            // candidate's years of matching experience for years_scope, from ONE role's span in CANDIDATE below — never sum two overlapping/concurrent roles into one total
  "role_family": "product"|"technical_pm"|"qa"|"support_cs"|"solutions_implementation"|"business_analyst"|"engineering"|"other",
  "requirements_total": integer,            // count of listed hard requirements (skills, tools, years, domain)
  "requirements_met": integer,              // how many the candidate meets from CANDIDATE below; be strict, a tool the candidate has not used is not met

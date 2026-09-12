@@ -80,6 +80,8 @@ def llm_json(model, system, user, max_tokens=800):
     return obj
 
 
+# Legacy fallback only — superseded by the Haiku-extracted years_matched field (see
+# compute_score). Kept so rows scored before that field existed still get a years-gap check.
 CAND_YEARS = {"pm_title": 1, "qa_dev": 3, "total": 4}
 FAMILY_BONUS = {"product": 10, "technical_pm": 10, "qa": 10, "support_cs": 8, "solutions_implementation": 10,
                 "business_analyst": 6, "engineering": -10, "other": -15}
@@ -270,29 +272,46 @@ def red_flags(f):
 
 
 def compute_score(f):
-    """Deterministic score from extracted facts."""
+    """Deterministic score from extracted facts. Every path that can return 0 or apply a cap
+    appends a reason to f["flags"] first — including the ones that used to be silent (a job
+    zeroed by e.g. language_blocker looked identical to one zeroed by nothing in particular).
+    That visibility is what a false-negative audit actually needs to work from."""
     hard, cap, penalty, flags = red_flags(f)
     f["flags"] = flags
     if hard:
         return 0
-    if (not f.get("eligible_from_finland", True) or f.get("language_blocker") or f.get("timezone_blocker")
-            or f.get("clearance_or_defence") or f.get("seniority_title")):
-        return 0
+    if not f.get("eligible_from_finland", True):
+        flags.append("not eligible from Finland"); return 0
+    if f.get("language_blocker"):
+        flags.append("language_blocker"); return 0
+    if f.get("timezone_blocker"):
+        flags.append("timezone_blocker"); return 0
+    if f.get("clearance_or_defence"):
+        flags.append("clearance_or_defence"); return 0
+    if f.get("seniority_title"):
+        flags.append("seniority_title"); return 0
     floor = int(SALARY_FLOOR)
     sal = f.get("salary_eur_month")
     if sal and sal < floor:
-        return 0
+        flags.append(f"salary {sal} < floor {floor}"); return 0
     yrs, scope = f.get("years_required_num"), f.get("years_scope")
     if scope == "total" and yrs and yrs >= 6:
-        return 0
+        flags.append(f"years_required {yrs} (total) >= 6"); return 0
     total, met = max(int(f.get("requirements_total") or 0), 1), int(f.get("requirements_met") or 0)
     score = 45 + 45 * min(met / total, 1.0)                 # 45..90 from requirements match
-    if yrs and scope in CAND_YEARS:
-        gap = yrs - CAND_YEARS[scope]
+    # years_matched is Haiku-extracted per posting (a single role's span, never summed across
+    # overlapping roles — see score_cash.md). CAND_YEARS is the old static per-scope fallback,
+    # kept only for rows scored before years_matched existed.
+    matched = f.get("years_matched")
+    if matched is None:
+        matched = CAND_YEARS.get(scope)
+    if yrs and matched is not None:
+        gap = yrs - matched
         if gap >= 5:
-            return 0
+            flags.append(f"years gap {gap} (required {yrs}, matched {matched})"); return 0
         if gap > 0:
             score -= 10 * gap
+            flags.append(f"years gap {gap} (required {yrs}, matched {matched}, -{10*gap})")
     score += FAMILY_BONUS.get(f.get("role_family"), -15)
     if f.get("domain_required"):
         score -= 10
@@ -382,6 +401,59 @@ def rescore():
             print(f"rescored {i}/{len(todo)}", flush=True)
 
 
+EU_EEA_UK_COUNTRIES = {
+    "austria", "belgium", "bulgaria", "croatia", "cyprus", "czech republic", "czechia", "denmark",
+    "estonia", "finland", "france", "germany", "greece", "hungary", "ireland", "italy", "latvia",
+    "liechtenstein", "lithuania", "luxembourg", "malta", "netherlands", "norway", "poland",
+    "portugal", "romania", "slovakia", "slovenia", "spain", "sweden", "iceland",
+    "united kingdom", "uk", "great britain",
+}
+
+
+def _looks_eu(f):
+    country = f"{f.get('company_country') or ''} {f.get('hq_country') or ''}".lower()
+    return f.get("geo_verdict") == "eu_ok" or any(c in country for c in EU_EEA_UK_COUNTRIES)
+
+
+def _audit_rows(days=21, threshold=60):
+    """Rows from the last `days` scoring below `threshold` whose company looks EU/EEA/UK,
+    recomputed fresh (current rules, stored facts, no network/LLM calls). Returns
+    {rule: [(url, first_seen, facts, score), ...]}."""
+    from collections import defaultdict
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    con = db()
+    rows = con.execute("SELECT url, first_seen, payload FROM jobs WHERE first_seen >= ?", (cutoff,)).fetchall()
+
+    by_rule = defaultdict(list)
+    for url, seen, payload in rows:
+        j = json.loads(payload)
+        f = dict(j.get("scoring") or {})
+        f["title"], f["company"] = j.get("title", ""), j.get("company", "")
+        score = compute_score(f)
+        if score >= threshold or not _looks_eu(f):
+            continue
+        rule = f["flags"][0] if f["flags"] else "no rule fired (low fit / not extracted)"
+        by_rule[rule].append((url, seen, f, score))
+    return by_rule
+
+
+def audit_false_negatives(days=21, threshold=60):
+    """Candidates for a false-negative spot check — see _audit_rows()."""
+    by_rule = _audit_rows(days, threshold)
+    total = sum(len(v) for v in by_rule.values())
+    print(f"{total} EU/EEA/UK rows from the last {days}d scoring below {threshold}, grouped by rule:\n")
+    for rule, items in sorted(by_rule.items(), key=lambda kv: -len(kv[1])):
+        print(f"=== {rule}  ({len(items)}) ===")
+        for url, seen, f, score in items:
+            print(f"  {score:>3}  {f['title'][:50]:<50} {f['company'][:25]:<25} seen {seen}")
+            print(f"       all flags: {f.get('flags')}")
+            print(f"       language_blocker={f.get('language_blocker')}  residency_restriction={f.get('residency_restriction')}"
+                  f"  years_required={f.get('years_required')!r}  years_matched={f.get('years_matched')}")
+            print(f"       {url}")
+        print()
+
+
 def recompute_report(n=30, dry_run=True):
     """Recompute compute_score() on the last n DB rows from stored facts only — no re-fetch, no LLM call."""
     con = db()
@@ -406,6 +478,29 @@ def recompute_report(n=30, dry_run=True):
     else:
         con.commit()
         print("applied.")
+
+
+def reextract(urls, dry_run=False):
+    """Re-run Haiku extraction only (no re-fetch, no scraping) on specific stored rows, using
+    whatever prompt/compute_score is current. For prompt-only changes where the scraped
+    description/ats_text hasn't changed and doesn't need to."""
+    con = db()
+    print(f"{'old':>4} {'new':>4}  title / company")
+    for url in urls:
+        row = con.execute("SELECT payload FROM jobs WHERE url=?", (url,)).fetchone()
+        if not row:
+            print(f"NOT FOUND: {url}")
+            continue
+        j = json.loads(row[0])
+        old_score = (j.get("scoring") or {}).get("score", 0)
+        j["scoring"] = score(j)
+        new_score = j["scoring"]["score"]
+        print(f"{old_score:>4} {new_score:>4}  {j.get('title', '')[:50]:<50} {j.get('company', '')[:25]}")
+        if not dry_run:
+            con.execute("UPDATE jobs SET score=?, payload=? WHERE url=?", (new_score, json.dumps(j), url))
+            con.commit()
+    if dry_run:
+        print("(dry run — nothing written)")
 
 
 def refetch(urls, dry_run=False):
@@ -459,6 +554,8 @@ def backfill_geo(min_score=50, dry_run=False):
         for k in OFFER_DETAIL_FIELDS:
             if details.get(k) not in (None, ""):
                 f[k] = details[k]
+                j[k] = details[k]  # also top-level: score()/reextract() only preserve fields
+                                    # found here, since they always start from a fresh Haiku call
         f["title"] = j.get("title", "")
         f["company"] = j.get("company", "")
         new_score = compute_score(f)
@@ -549,10 +646,18 @@ if __name__ == "__main__":
         idx = sys.argv.index("--refetch")
         urls = [a for a in sys.argv[idx + 1:] if not a.startswith("--")]
         refetch(urls, dry_run=dry)
+    elif "--reextract" in sys.argv:
+        idx = sys.argv.index("--reextract")
+        urls = [a for a in sys.argv[idx + 1:] if not a.startswith("--")]
+        reextract(urls, dry_run=dry)
     elif "--backfill-geo" in sys.argv:
         min_score = 50
         if "--min-score" in sys.argv:
             min_score = int(sys.argv[sys.argv.index("--min-score") + 1])
         backfill_geo(min_score=min_score, dry_run=dry)
+    elif "--audit-negatives" in sys.argv:
+        days = int(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 21
+        threshold = int(sys.argv[sys.argv.index("--threshold") + 1]) if "--threshold" in sys.argv else 60
+        audit_false_negatives(days=days, threshold=threshold)
     else:
         main(dry_run=dry)

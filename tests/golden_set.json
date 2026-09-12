@@ -609,5 +609,54 @@
       "title": "QA Engineer",
       "company": "Blocklist Fixture 3"
     }
+  },
+  {
+    "label": "negative",
+    "name": "Fixture: single-role years_matched",
+    "url": "https://example.invalid/fixture-years-matched-single-role",
+    "note": "Synthetic fixture, not a real posting. Tests the compute_score CONTRACT for years_matched (that it treats the value as an atomic single-role span, with no summing logic of its own) — it cannot verify that Haiku itself avoids summing overlapping roles when extracting from real text; that needs a live-LLM check. If years_matched were wrongly summed across two overlapping roles (e.g. 3+3=6 instead of 3), this would score ~80 (false positive) instead of the correct 0.",
+    "facts": {
+      "requirements_total": 6,
+      "requirements_met": 6,
+      "role_family": "product",
+      "years_required_num": 8,
+      "years_scope": "total",
+      "years_matched": 3,
+      "title": "Fixture: single-role years_matched",
+      "company": "Fixture Co A",
+      "reason": "years_matched_single_role"
+    }
+  },
+  {
+    "label": "positive",
+    "name": "Fixture: category-not-named-tool requirement",
+    "url": "https://example.invalid/fixture-category-requirement",
+    "note": "Synthetic fixture. \"Salesforce or another CRM\" means the requirement is the category (a CRM), not the named tool — a candidate with a different CRM still meets it. Tests that requirements_met correctly reflects that when given, again not that Haiku itself parses the phrasing correctly (live-LLM concern).",
+    "facts": {
+      "requirements_total": 5,
+      "requirements_met": 5,
+      "role_family": "solutions_implementation",
+      "years_required_num": 2,
+      "years_scope": "total",
+      "years_matched": 3,
+      "title": "Fixture: category-not-named-tool requirement",
+      "company": "Fixture Co B"
+    }
+  },
+  {
+    "label": "positive",
+    "name": "Fixture: example tool is not a separate requirement",
+    "url": "https://example.invalid/fixture-example-tool",
+    "note": "Synthetic fixture. \"A CRM such as HubSpot\" is one requirement (the category), not two (category + the named example) — requirements_total must reflect that. Tests the resulting arithmetic given a correctly-sized total, not Haiku's own parsing of the phrasing (live-LLM concern).",
+    "facts": {
+      "requirements_total": 6,
+      "requirements_met": 5,
+      "role_family": "qa",
+      "years_required_num": 2,
+      "years_scope": "total",
+      "years_matched": 3,
+      "title": "Fixture: example tool is not a separate requirement",
+      "company": "Fixture Co C"
+    }
   }
 ]

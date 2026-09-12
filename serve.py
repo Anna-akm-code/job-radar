@@ -1,8 +1,9 @@
 """Local UI: python serve.py -> http://127.0.0.1:5000
 Lists scored jobs from jobs.db, button generates CV block + cover letter on demand (Sonnet), saves to DB."""
 import html, json, sqlite3
+from datetime import date
 from flask import Flask, request, redirect
-from run import DB, tailor  # reuses .env loading, prompts, client
+from run import DB, tailor, compute_score  # reuses .env loading, prompts, client
 
 app = Flask(__name__)
 CSS = """body{font:15px/1.45 system-ui;max-width:960px;margin:2rem auto;padding:0 1rem;color:#222}
@@ -14,12 +15,15 @@ button{background:#3D3B5C;color:#fff;border:0;padding:.4rem .8rem;border-radius:
 
 
 # status is new / shortlisted / applied / rejected. Nothing in run.py's fetch/rescore/backfill
-# writes this column (they only ever touch score+payload) — it is user-set only, via /status.
+# writes this column or applied_at (they only ever touch score+payload) — both are user-set
+# only, via /status.
 def ensure_status():
     con = sqlite3.connect(DB)
     cols = [r[1] for r in con.execute("PRAGMA table_info(jobs)")]
     if "status" not in cols:
         con.execute("ALTER TABLE jobs ADD COLUMN status TEXT DEFAULT 'new'")
+    if "applied_at" not in cols:
+        con.execute("ALTER TABLE jobs ADD COLUMN applied_at TEXT")
     con.execute("UPDATE jobs SET status='new' WHERE status='' OR status IS NULL")
     con.execute("UPDATE jobs SET status='rejected' WHERE status='skip'")  # one-time vocabulary migration
     con.commit()
@@ -28,11 +32,12 @@ def ensure_status():
 def rows(min_score, days, view):
     ensure_status()
     con = sqlite3.connect(DB)
-    q = "SELECT url, first_seen, score, payload, tailored, status FROM jobs ORDER BY score DESC"
+    q = "SELECT url, first_seen, score, payload, tailored, status, applied_at FROM jobs ORDER BY score DESC"
     out = []
-    for url, seen, score, payload, tailored, status in con.execute(q):
+    for url, seen, score, payload, tailored, status, applied_at in con.execute(q):
         j = json.loads(payload); j["tailored"] = json.loads(tailored) if tailored else None
         j["first_seen"] = seen; j["status"] = status or "new"; j["score_col"] = score
+        j["applied_at"] = applied_at
         out.append(j)
 
     if view == "shortlist":
@@ -40,11 +45,31 @@ def rows(min_score, days, view):
         # row's number, and its fetch date only gets staler, but it must stay visible here.
         return sorted((j for j in out if j["status"] == "shortlisted"), key=lambda j: -j["score_col"])
 
+    if view == "applied":
+        # Same date/score independence as shortlist, but sorted by when you applied, not score.
+        applied = [j for j in out if j["status"] == "applied"]
+        return sorted(applied, key=lambda j: j["applied_at"] or j["first_seen"], reverse=True)
+
+    if view == "dropped":
+        # Recomputed fresh (current rules) so a stale stored score/flag set from before a rule
+        # change doesn't mislabel why a row was dropped — this is the "catch the next Workwize"
+        # view: everything below threshold, with the rule that actually did it, right in the UI.
+        dropped = []
+        for j in out:
+            f = dict(j["scoring"] or {})
+            f["title"], f["company"] = j.get("title", ""), j.get("company", "")
+            fresh_score = compute_score(f)
+            if fresh_score < min_score:
+                j["scoring"] = f
+                j["score_col"] = fresh_score
+                dropped.append(j)
+        seen_days = sorted({j["first_seen"] for j in dropped}, reverse=True)[:days]
+        dropped = [j for j in dropped if j["first_seen"] in seen_days]
+        return sorted(dropped, key=lambda j: -j["score_col"])
+
     out = [j for j in out if j["score_col"] >= min_score]
     if view == "open":
         out = [j for j in out if j["status"] not in ("applied", "rejected", "shortlisted")]
-    elif view == "applied":
-        out = [j for j in out if j["status"] == "applied"]
     # view == "all": no status filter beyond min_score
 
     seen_days = sorted({j["first_seen"] for j in out}, reverse=True)[:days]
@@ -67,9 +92,10 @@ def card(j, i):
     buttons = "".join(f'<button name="status" value="{v}" class="sm">{label}</button> '
                        for v, label in (("shortlisted", "Shortlist"), ("applied", "Applied"),
                                          ("rejected", "Reject"), ("new", "Reopen")) if v != status)
+    applied_bit = f" · applied {e(j['applied_at'])}" if j.get("applied_at") else ""
     return f"""<div class="card"><div class="head"><span class="score">{s['score']}</span><div>
 <h2><a href="{e(j['url'])}" target="_blank">{e(j['title'])}</a></h2>
-<div class="meta">{e(j['company'])} · {e(j['remote_from'])} · {e(j.get('contract',''))} · {e(str(s.get('salary') or 'salary not shown'))} · years req: {e(str(s.get('years_required') or '?'))} · flags: {e(', '.join(s.get('flags') or []) or 'none')} · seen {e(j['first_seen'])} · status: {e(status)}</div></div></div>
+<div class="meta">{e(j['company'])} · {e(j['remote_from'])} · {e(j.get('contract',''))} · {e(str(s.get('salary') or 'salary not shown'))} · years req: {e(str(s.get('years_required') or '?'))} · flags: {e(', '.join(s.get('flags') or []) or 'none')} · seen {e(j['first_seen'])} · status: {e(status)}{applied_bit}</div></div></div>
 <p>{e(s.get('reason',''))}</p>{body}
 <p><form method="post" action="/status" style="display:inline"><input type="hidden" name="url" value="{e(j['url'])}">
 {buttons}</form></p></div>"""
@@ -83,7 +109,7 @@ def index():
     sel = lambda v: "selected" if v == view else ""
     return f"""<!doctype html><meta charset="utf-8"><title>job-radar jobs</title><style>{CSS}</style>
 <form class="bar">Min score <input type="number" name="min" value="{min_score}"> Last <input type="number" name="days" value="{days}"> run-days
-<select name="view"><option value="open" {sel('open')}>Open</option><option value="shortlist" {sel('shortlist')}>Shortlist</option><option value="applied" {sel('applied')}>Applied</option><option value="all" {sel('all')}>All</option></select>
+<select name="view"><option value="open" {sel('open')}>Open</option><option value="shortlist" {sel('shortlist')}>Shortlist</option><option value="applied" {sel('applied')}>Applied</option><option value="dropped" {sel('dropped')}>Dropped by rule</option><option value="all" {sel('all')}>All</option></select>
 <button>Show</button> <span>{len(jobs)} jobs</span></form>{cards or '<p>Nothing here.</p>'}"""
 
 
@@ -91,7 +117,13 @@ def index():
 def set_status():
     ensure_status()
     con = sqlite3.connect(DB)
-    con.execute("UPDATE jobs SET status=? WHERE url=?", (request.form.get("status", "new"), request.form["url"])); con.commit()
+    status = request.form.get("status", "new")
+    url = request.form["url"]
+    if status == "applied":
+        con.execute("UPDATE jobs SET status=?, applied_at=? WHERE url=?", (status, date.today().isoformat(), url))
+    else:
+        con.execute("UPDATE jobs SET status=? WHERE url=?", (status, url))
+    con.commit()
     return redirect(request.referrer or "/")
 
 
